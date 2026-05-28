@@ -398,17 +398,55 @@ function isTest(body) {
   return /THIS IS A TEST PERIODIC PAGE/i.test(body);
 }
 
+function frameDistance(a, b) {
+  // OTA frame distance between two "CC.FFF" strings, handling cycle 14 -> 0
+  // wraparound. FLEX has 15 cycles per hour, 128 frames per cycle.
+  const parts = (s) => {
+    const m = String(s).trim().match(/^(\d+)\.(\d+)$/);
+    return m ? [parseInt(m[1], 10), parseInt(m[2], 10)] : null;
+  };
+  const pa = parts(a); const pb = parts(b);
+  if (!pa || !pb) return Infinity;
+  const ai = pa[0] * 128 + pa[1];
+  const bi = pb[0] * 128 + pb[1];
+  const span = 15 * 128;
+  let d = Math.abs(ai - bi);
+  if (d > span / 2) d = span - d;
+  return d;
+}
+
+function looksComplete(body) {
+  // Fragments cut by the 248-char FLEX limit almost never end on punctuation;
+  // they end mid-word. If prev ends with a terminator, treat as complete.
+  const trimmed = String(body || '').trim();
+  if (!trimmed) return true;
+  return /[.!?;)\]>]$/.test(trimmed);
+}
+
 function shouldStitch(prev, cur) {
   if (!prev || !cur) return false;
+  // Only ALN messages fragment. NUM and TON are short and self-contained.
+  if (prev.type !== 'ALN' || cur.type !== 'ALN') return false;
   if (prev.capcode !== cur.capcode) return false;
-  if (prev.type !== cur.type) return false;
+  if (prev.proto !== cur.proto) return false;
   if (isTest(prev.body) || isTest(cur.body)) return false;
-  // Live arrivals: real-time window
-  if (cur._receivedAt && prev._receivedAt) {
-    return (cur._receivedAt - prev._receivedAt) <= STITCH_WINDOW_MS;
+  // Don't merge a complete-looking prior with anything — likely a repeat,
+  // not a continuation (e.g., recurring "Battery Low ..." alerts).
+  if (looksComplete(prev.body)) return false;
+  // Fragments arrive in consecutive frames for the same recipient. Allow
+  // up to 5 frames of slack (~9.4 s OTA) to handle frame-group bouncing.
+  if (frameDistance(prev.frame, cur.frame) > 5) return false;
+  return true;
+}
+
+function findStitchTarget(cur) {
+  // Scan recent pages (not just pages[0]) — other capcodes' pages can
+  // interleave between our two fragments. Cap the scan for performance.
+  const LIMIT = 30;
+  for (let i = 0; i < Math.min(pages.length, LIMIT); i++) {
+    if (shouldStitch(pages[i], cur)) return pages[i];
   }
-  // Historical replay: same decode second is a strong signal
-  return prev.ts === cur.ts;
+  return null;
 }
 
 const DIGITS_ONLY = /^[\d\s\-]+$/;
@@ -471,12 +509,46 @@ function el(tag, className, textValue) {
 }
 
 function structureBody(text) {
-  // FLEX email-style pages often pack fields onto one line using 2+ spaces
-  // as separators. Insert a newline before any "Label:" preceded by 2+
-  // spaces. Excludes URLs (Label://) and lowercase tokens to avoid breaking
-  // times like "9:05" or words like "is:".
-  const sep = /[ \t]{2,}(?=[A-Z][\w &#/.-]{0,30}?:(?!\/\/))/g;
-  return text.replace(sep, '\n');
+  // Per-line: find "Label:" anchors. If a line has 2+ of them, treat it
+  // as a packed tabular line and insert a newline before each (except
+  // one at the very start).
+  //
+  // Two alternatives in the anchor regex:
+  //   A) Short 2-char labels like "ID:", "Re:", "Fr:" — must end at the
+  //      colon immediately (no multi-word extension), so "PM Time..."
+  //      can't sneak through.
+  //   B) 3+ char labels with optional multi-word body up to ~20 chars,
+  //      e.g. "Date:", "Last Name:", "Time/date offset:", "CallBack #:".
+  //
+  // First-word class excludes underscore (`_`) so underscore-joined
+  // value identifiers don't get swallowed as one giant label.
+  // Negative lookahead rejects URLs ("HTTP://...") by refusing a `/`
+  // right after the colon. Plain word chars or end of line are fine,
+  // which is what catches "Time/date offset:UTC".
+  const labelRe = /(?:^|\s)((?:[A-Z][a-zA-Z0-9/.\-]:|[A-Z][a-zA-Z0-9/.\-]{2,14}[a-zA-Z0-9 /#.\-]{0,20}?:))(?!\/)/g;
+  const lines = String(text).split('\n');
+  const out = [];
+  for (const line of lines) {
+    const hits = [];
+    for (const m of line.matchAll(labelRe)) {
+      const labelStart = m.index + (m[0].length - m[1].length);
+      hits.push({ start: labelStart, end: labelStart + m[1].length, label: m[1] });
+    }
+    if (hits.length < 2) {
+      out.push(line);
+      continue;
+    }
+    let rebuilt = '';
+    let cursor = 0;
+    for (const h of hits) {
+      const between = line.slice(cursor, h.start).replace(/[ \t]+$/, '');
+      rebuilt += (h.start === 0) ? h.label : (between + '\n' + h.label);
+      cursor = h.end;
+    }
+    rebuilt += line.slice(cursor);
+    out.push(rebuilt);
+  }
+  return out.join('\n');
 }
 
 function renderBody(text) {
@@ -540,20 +612,19 @@ function rerender() {
 
 function addPage(p) {
   p._receivedAt = Date.now();
-  const prev = pages[0];
-  if (shouldStitch(prev, p)) {
-    prev.body = prev.body + p.body;
-    prev._partCount = (prev._partCount || 1) + 1;
-    prev._receivedAt = p._receivedAt;
-    if (matches(prev)) {
-      const existing = list.querySelector('[data-id="' + prev.id + '"]');
+  const target = findStitchTarget(p);
+  if (target) {
+    target.body = target.body + p.body;
+    target._partCount = (target._partCount || 1) + 1;
+    target._receivedAt = p._receivedAt;
+    if (matches(target)) {
+      const existing = list.querySelector('[data-id="' + target.id + '"]');
       if (existing) {
-        const newNode = makePage(prev, true);
-        existing.replaceWith(newNode);
+        existing.replaceWith(makePage(target, true));
       } else {
         const empty = list.querySelector('.empty');
         if (empty) empty.remove();
-        list.insertBefore(makePage(prev, true), list.firstChild);
+        list.insertBefore(makePage(target, true), list.firstChild);
       }
     }
     updateCount();
@@ -565,8 +636,7 @@ function addPage(p) {
   if (matches(p)) {
     const empty = list.querySelector('.empty');
     if (empty) empty.remove();
-    const node = makePage(p, true);
-    list.insertBefore(node, list.firstChild);
+    list.insertBefore(makePage(p, true), list.firstChild);
   }
   updateCount();
 }
@@ -600,11 +670,15 @@ function connect() {
     const arr = JSON.parse(e.data);  // oldest-first
     pages.length = 0;
     const stitched = [];
+    const LOOKBACK = 30;
     for (const p of arr) {
-      const last = stitched[stitched.length - 1];
-      if (shouldStitch(last, p)) {
-        last.body = last.body + p.body;
-        last._partCount = (last._partCount || 1) + 1;
+      let target = null;
+      for (let i = stitched.length - 1; i >= Math.max(0, stitched.length - LOOKBACK); i--) {
+        if (shouldStitch(stitched[i], p)) { target = stitched[i]; break; }
+      }
+      if (target) {
+        target.body = target.body + p.body;
+        target._partCount = (target._partCount || 1) + 1;
       } else {
         stitched.push(Object.assign({}, p, { _partCount: 1 }));
       }
