@@ -483,6 +483,17 @@ main {
 }
 .body font { font-family: inherit; }
 .body b, .body strong { color: #fff; font-weight: 600; }
+.hints {
+  padding-left: 14px;
+  margin-left: 2px;
+  margin-top: 6px;
+}
+.hint {
+  color: var(--muted);
+  font-family: 'IBM Plex Mono', ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+}
 .empty {
   padding: 96px 0;
   text-align: center;
@@ -732,6 +743,11 @@ function makePage(p, fresh) {
   }
   article.appendChild(meta);
   article.appendChild(renderBody(p.body));
+  if (p.hints && p.hints.length) {
+    const hintsEl = el('div', 'hints');
+    p.hints.forEach(h => hintsEl.appendChild(el('div', 'hint', '↳ ' + h.num + ' — ' + h.place)));
+    article.appendChild(hintsEl);
+  }
   return article;
 }
 
@@ -770,6 +786,9 @@ function addPage(p) {
     target.body = target.body + p.body;
     target._partCount = (target._partCount || 1) + 1;
     target._receivedAt = p._receivedAt;
+    if (p.hints && p.hints.length) {
+      target.hints = (target.hints || []).concat(p.hints);
+    }
     if (matches(target)) {
       const existing = list.querySelector('[data-id="' + target.id + '"]');
       if (existing) {
@@ -891,6 +910,9 @@ function connect() {
       if (target) {
         target.body = target.body + p.body;
         target._partCount = (target._partCount || 1) + 1;
+        if (p.hints && p.hints.length) {
+          target.hints = (target.hints || []).concat(p.hints);
+        }
       } else {
         stitched.push(Object.assign({}, p, { _partCount: 1 }));
       }
