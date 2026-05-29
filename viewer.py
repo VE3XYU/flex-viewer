@@ -408,6 +408,38 @@ main {
   transition: background 100ms;
 }
 .capcode:hover { background: rgba(255, 155, 64, 0.14); }
+.label {
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 500;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 100ms, border-color 120ms;
+}
+.label:hover { background: rgba(255, 155, 64, 0.14); border-color: var(--accent); }
+.tagbtn {
+  color: var(--dim);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 140ms, color 120ms;
+}
+.page:hover .tagbtn { opacity: 0.55; }
+.tagbtn:hover { color: var(--text); opacity: 1; }
+.label-edit {
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11px;
+  padding: 1px 6px;
+  width: 150px;
+}
+.label-edit:focus { outline: none; }
 .badge {
   font-size: 10.5px;
   padding: 1px 7px;
@@ -490,6 +522,7 @@ const SANITIZE_CONFIG = {
 
 const pages = [];
 let filter = '';
+let labels = {};  // capcode -> name, fetched from /labels
 const STITCH_WINDOW_MS = 8000;
 
 const ALL_TYPES = ['ALN', 'NUM', 'TON', 'TEST'];
@@ -570,7 +603,8 @@ function bucket(p) {
 function matches(p) {
   if (!enabledTypes.has(bucket(p))) return false;
   if (!filter) return true;
-  return p.capcode.includes(filter) || p.body.toLowerCase().includes(filter);
+  const lbl = (labels[p.capcode] || '').toLowerCase();
+  return p.capcode.includes(filter) || p.body.toLowerCase().includes(filter) || lbl.includes(filter);
 }
 
 function refreshChipCounts() {
@@ -684,6 +718,10 @@ function makePage(p, fresh) {
   const meta = el('div', 'meta');
   meta.appendChild(el('span', 'ts', p.ts));
   meta.appendChild(el('span', 'capcode', p.capcode));
+  const name = labels[p.capcode];
+  const tag = name ? el('span', 'label', name) : el('span', 'tagbtn', '⊕ tag');
+  tag.dataset.capcode = p.capcode;
+  meta.appendChild(tag);
   meta.appendChild(el('span', 'badge ' + p.type, p.type));
   if (p._partCount > 1) {
     meta.appendChild(el('span', 'parts', p._partCount + ' parts'));
@@ -775,6 +813,11 @@ filterClear.addEventListener('click', () => {
 });
 
 list.addEventListener('click', (e) => {
+  const tag = e.target.closest('.label, .tagbtn');
+  if (tag) {
+    startLabelEdit(tag, tag.dataset.capcode);
+    return;
+  }
   const cap = e.target.closest('.capcode');
   if (!cap) return;
   const code = cap.textContent.trim();
@@ -784,6 +827,46 @@ list.addEventListener('click', (e) => {
   syncClearVisibility();
   rerender();
 });
+
+function loadLabels() {
+  fetch('/labels')
+    .then(r => (r.ok ? r.json() : {}))
+    .then(data => { labels = data || {}; rerender(); })
+    .catch(() => {});
+}
+
+function saveLabel(capcode, label) {
+  fetch('/labels', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ capcode: capcode, label: label }),
+  })
+    .then(r => (r.ok ? r.json() : null))
+    .then(data => { if (data) labels = data; rerender(); })
+    .catch(() => rerender());
+}
+
+function startLabelEdit(spanEl, capcode) {
+  const input = el('input', 'label-edit');
+  input.type = 'text';
+  input.value = labels[capcode] || '';
+  input.placeholder = 'label…';
+  spanEl.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = (save) => {
+    if (done) return;
+    done = true;
+    if (save) saveLabel(capcode, input.value.trim());
+    else rerender();
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  });
+  input.addEventListener('blur', () => finish(false));
+}
 
 function connect() {
   const src = new EventSource('/stream');
@@ -818,6 +901,7 @@ function connect() {
   src.onmessage = e => addPage(JSON.parse(e.data));
 }
 
+loadLabels();
 connect();
 """
 
