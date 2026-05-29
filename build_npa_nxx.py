@@ -94,10 +94,33 @@ SAMPLE_CSV = (
 )
 
 
+SHOULD_MATCH = [
+    "905-555-0142", "(905) 555-0142", "905.555.0142", "9055550142",
+    "+1 905 555 0142", "1-905-555-0142", "call 416-555-0173 now",
+    "Ph (647) 555-0190 ext",
+]
+SHOULD_NOT_MATCH = [
+    "1234567", "0123456789012345", "15:42:07", "12.045", "x5512", "2026-05-28",
+    "ID9055550142",
+]
+
+
 def check():
     parsed = dict(parse_csv(SAMPLE_CSV))
     assert parsed == {"905200": "Castlemore, ON", "905201": "Markham, ON"}, parsed
     print("parse_csv ok")
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))  # so import works from any cwd
+    import viewer
+    viewer._npa_nxx = {
+        "905555": "Newmarket, ON", "416555": "Toronto, ON", "647555": "Toronto, ON",
+    }
+    for s in SHOULD_MATCH:
+        assert viewer.phone_hints(s), "expected a hint for %r" % s
+    for s in SHOULD_NOT_MATCH:
+        hits = viewer.phone_hints(s)
+        assert not hits, "unexpected hint for %r: %r" % (s, hits)
+    print("phone_hints ok")
     print("all checks passed")
 
 

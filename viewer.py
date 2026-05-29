@@ -2,6 +2,7 @@
 """FLEX live page viewer — tails live.log, serves a local web UI."""
 import http.server
 import json
+import os
 import queue
 import re
 import threading
@@ -14,12 +15,14 @@ LOG_PATH = Path(__file__).resolve().parent / "live.log"
 PORT = 8732
 HISTORY_SIZE = 200
 MAX_BODY = 4096
+NPA_NXX_PATH = Path(__file__).resolve().parent / "data" / "npa-nxx-on.json"
 
 _state_lock = threading.Lock()
 _subscribers: list[queue.Queue] = []
 _history: deque = deque(maxlen=HISTORY_SIZE)
 _next_id = 0
 _id_lock = threading.Lock()
+_npa_nxx: dict[str, str] = {}  # "905201" -> "Markham, ON"; loaded once in main()
 
 
 def alloc_id() -> int:
@@ -27,6 +30,40 @@ def alloc_id() -> int:
     with _id_lock:
         _next_id += 1
         return _next_id
+
+
+def load_npa_nxx() -> None:
+    """Load+invert the bundled NPA-NXX table. Missing file disables hints."""
+    global _npa_nxx
+    table = {}
+    try:
+        with NPA_NXX_PATH.open("r", encoding="utf-8") as f:
+            grouped = json.load(f)
+        for place, codes in grouped.items():
+            for code in codes:
+                table[code] = place
+    except Exception:
+        _npa_nxx = {}
+        return
+    _npa_nxx = table
+
+
+def phone_hints(body: str) -> list:
+    """Detect NANP numbers in body and map NPA-NXX -> town. Best-effort."""
+    if not _npa_nxx:
+        return []
+    hints = []
+    seen = set()
+    for m in PHONE_RE.finditer(body):
+        place = _npa_nxx.get(m.group(1) + m.group(2))
+        if not place:
+            continue
+        num = m.group(0).strip()
+        if num in seen:
+            continue
+        seen.add(num)
+        hints.append({"num": num, "place": place})
+    return hints
 
 
 PIPE_RE = re.compile(
@@ -41,6 +78,11 @@ LEGACY_RE = re.compile(
     r"(?P<type>\S+) (?P<body>.*)$"
 )
 HEADER_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}: FLEX")
+# NANP 10-digit number in free text. Group 1 = NPA, group 2 = NXX.
+# Lookarounds reject digit runs, FLEX frames (12.045) and hyphen ranges.
+PHONE_RE = re.compile(
+    r"(?<![\w.\-])(?:\+?1[ .\-]?)?\(?([2-9]\d{2})\)?[ .\-]?([2-9]\d{2})[ .\-]?(\d{4})(?![\w.\-])"
+)
 
 
 def parse_record(text: str):
@@ -68,6 +110,7 @@ def parse_record(text: str):
         "capcode": d["capcode"].lstrip("0") or "0",
         "type": d["type"],
         "body": body,
+        "hints": phone_hints(body),
     }
 
 
@@ -840,6 +883,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
+    load_npa_nxx()
     prime_history()
     threading.Thread(target=tail_log, daemon=True).start()
     server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
