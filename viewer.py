@@ -10,7 +10,7 @@ import webbrowser
 from collections import deque
 from pathlib import Path
 
-LOG_PATH = Path.home() / "Documents" / "flex waves" / "live.log"
+LOG_PATH = Path(__file__).resolve().parent / "live.log"
 PORT = 8732
 HISTORY_SIZE = 200
 MAX_BODY = 4096
@@ -246,13 +246,18 @@ h1 {
   border-style: dashed;
 }
 .chip.off:hover { opacity: 0.6; }
-input[type=text] {
+.filter-wrap {
   margin-left: auto;
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+input[type=text] {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 4px;
   color: var(--text);
-  padding: 6px 10px;
+  padding: 6px 28px 6px 10px;
   font-family: inherit;
   font-size: 13px;
   width: 240px;
@@ -264,6 +269,26 @@ input[type=text]:focus {
   background: #161a22;
 }
 input[type=text]::placeholder { color: var(--dim); }
+.filter-clear {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: transparent;
+  border: none;
+  color: var(--dim);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 3px;
+  display: none;
+  font-family: inherit;
+  transition: color 120ms, background 120ms;
+}
+.filter-clear:hover { color: var(--text); background: rgba(255,255,255,0.06); }
+.filter-clear:focus-visible { outline: none; color: var(--accent); }
+.filter-clear.visible { display: block; }
 main {
   max-width: 960px;
   margin: 0 auto;
@@ -371,9 +396,21 @@ main {
 JS = r"""
 const list = document.getElementById('list');
 const filterInput = document.getElementById('filter');
+const filterClear = document.getElementById('filterClear');
 const countEl = document.getElementById('count');
 const statusEl = document.getElementById('status');
 const statusText = document.getElementById('statusText');
+
+function syncClearVisibility() {
+  filterClear.classList.toggle('visible', filterInput.value.length > 0);
+}
+
+function clearFilter() {
+  filterInput.value = '';
+  filter = '';
+  syncClearVisibility();
+  rerender();
+}
 
 const SANITIZE_CONFIG = {
   ALLOWED_TAGS: ['b', 'i', 'u', 'em', 'strong', 'br', 'font'],
@@ -525,7 +562,11 @@ function structureBody(text) {
   // Negative lookahead rejects URLs ("HTTP://...") by refusing a `/`
   // right after the colon. Plain word chars or end of line are fine,
   // which is what catches "Time/date offset:UTC".
-  const labelRe = /(?:^|\s)((?:[A-Z][a-zA-Z0-9/.\-]:|[A-Z][a-zA-Z0-9/.\-]{2,14}[a-zA-Z0-9 /#.\-]{0,20}?:))(?!\/)/g;
+  // Continuation allows single spaces but NOT consecutive spaces — `  `
+  // is the FLEX field separator. Without this guard, a multi-word match
+  // would eat across the `  ` and absorb the prior field's value into
+  // the next label.
+  const labelRe = /(?:^|\s)((?:[A-Z][a-zA-Z0-9/.\-]:|[A-Z][a-zA-Z0-9/.\-]{2,14}(?:[a-zA-Z0-9/#.\-]| (?! )){0,20}?:))(?!\/)/g;
   const lines = String(text).split('\n');
   const out = [];
   for (const line of lines) {
@@ -545,7 +586,10 @@ function structureBody(text) {
       rebuilt += (h.start === 0) ? h.label : (between + '\n' + h.label);
       cursor = h.end;
     }
-    rebuilt += line.slice(cursor);
+    // After the last label, any remaining `  +` is also a FLEX field
+    // separator — typically the boundary between the final labelled
+    // value and a trailing freeform message body. Break on it too.
+    rebuilt += line.slice(cursor).replace(/  +/g, '\n');
     out.push(rebuilt);
   }
   return out.join('\n');
@@ -643,7 +687,20 @@ function addPage(p) {
 
 filterInput.addEventListener('input', () => {
   filter = filterInput.value.trim().toLowerCase();
+  syncClearVisibility();
   rerender();
+});
+
+filterInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && filterInput.value) {
+    e.preventDefault();
+    clearFilter();
+  }
+});
+
+filterClear.addEventListener('click', () => {
+  clearFilter();
+  filterInput.focus();
 });
 
 list.addEventListener('click', (e) => {
@@ -653,6 +710,7 @@ list.addEventListener('click', (e) => {
   filterInput.value = code;
   filter = code.toLowerCase();
   filterInput.focus();
+  syncClearVisibility();
   rerender();
 });
 
@@ -716,7 +774,10 @@ def render_html() -> bytes:
         '    <button class="chip" data-type="TON" type="button">TON<span class="count" data-type-count="TON">0</span></button>\n',
         '    <button class="chip" data-type="TEST" type="button">Test<span class="count" data-type-count="TEST">0</span></button>\n',
         '  </div>\n',
-        '  <input type="text" id="filter" placeholder="filter capcode or text…" autocomplete="off">\n',
+        '  <div class="filter-wrap">\n',
+        '    <input type="text" id="filter" placeholder="filter capcode or text…" autocomplete="off">\n',
+        '    <button class="filter-clear" id="filterClear" type="button" aria-label="Clear filter" title="Clear filter (Esc)">×</button>\n',
+        '  </div>\n',
         '</header>\n',
         '<main id="list"><div class="empty">Listening for pages…</div></main>\n',
         "<script>",

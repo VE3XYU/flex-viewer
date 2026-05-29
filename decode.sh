@@ -10,8 +10,9 @@
 #   ./decode.sh "BlackHole 2ch" /tmp/my.log  # specify device + log
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEVICE="${1:-BlackHole 2ch}"
-LOG_PATH="${2:-$HOME/Documents/flex waves/live.log}"
+LOG_PATH="${2:-$SCRIPT_DIR/live.log}"
 
 mkdir -p "$(dirname "$LOG_PATH")"
 echo "device: $DEVICE"

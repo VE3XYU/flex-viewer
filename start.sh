@@ -10,7 +10,7 @@ set -uo pipefail
 cd "$(dirname "$0")"
 
 DEVICE="${DEVICE:-BlackHole 2ch}"
-LOG_PATH="${LOG_PATH:-$HOME/Documents/flex waves/live.log}"
+LOG_PATH="${LOG_PATH:-$PWD/live.log}"
 
 mkdir -p "$(dirname "$LOG_PATH")"
 
