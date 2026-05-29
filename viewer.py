@@ -16,6 +16,11 @@ PORT = 8732
 HISTORY_SIZE = 200
 MAX_BODY = 4096
 NPA_NXX_PATH = Path(__file__).resolve().parent / "data" / "npa-nxx-on.json"
+LABELS_PATH = Path(__file__).resolve().parent / "labels.json"
+MAX_LABEL_LEN = 64
+MAX_CAPCODE_LEN = 10
+MAX_LABELS = 5000
+MAX_POST_BODY = 4096
 
 _state_lock = threading.Lock()
 _subscribers: list[queue.Queue] = []
@@ -23,6 +28,8 @@ _history: deque = deque(maxlen=HISTORY_SIZE)
 _next_id = 0
 _id_lock = threading.Lock()
 _npa_nxx: dict[str, str] = {}  # "905201" -> "Markham, ON"; loaded once in main()
+_labels_lock = threading.Lock()
+_labels: dict[str, str] = {}  # "1234567" -> "Southlake"
 
 
 def alloc_id() -> int:
@@ -64,6 +71,27 @@ def phone_hints(body: str) -> list:
         seen.add(num)
         hints.append({"num": num, "place": place})
     return hints
+
+
+def load_labels() -> None:
+    global _labels
+    try:
+        with LABELS_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    with _labels_lock:
+        _labels = {(str(k).lstrip("0") or "0"): str(v) for k, v in data.items()}
+
+
+def save_labels(snapshot: dict) -> None:
+    """Atomic write: temp file in the same dir, then os.replace()."""
+    tmp = LABELS_PATH.with_name(LABELS_PATH.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(snapshot, f, ensure_ascii=False)
+    os.replace(tmp, LABELS_PATH)
 
 
 PIPE_RE = re.compile(
@@ -879,11 +907,83 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if q in _subscribers:
                         _subscribers.remove(q)
             return
+        if self.path == "/labels":
+            with _labels_lock:
+                data = json.dumps(dict(_labels)).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         self.send_error(404)
+
+    def do_POST(self):
+        if self.path != "/labels":
+            self.send_error(404)
+            return
+        # Local-only: reject anything not addressed to this loopback host.
+        allowed = ("127.0.0.1:%d" % PORT, "localhost:%d" % PORT)
+        if self.headers.get("Host", "") not in allowed:
+            self.send_error(403)
+            return
+        origin = self.headers.get("Origin")
+        if origin is None or not any(origin == "http://" + h for h in allowed):
+            self.send_error(403)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_error(400)
+            return
+        if length <= 0:
+            self.send_error(400)
+            return
+        if length > MAX_POST_BODY:
+            self.send_error(413)
+            return
+        try:
+            payload = json.loads(self.rfile.read(length))
+            capcode = str(payload["capcode"])
+            label = str(payload.get("label", ""))
+        except (ValueError, KeyError, TypeError):
+            self.send_error(400)
+            return
+        capcode = capcode.lstrip("0") or "0"
+        if not capcode.isascii() or not capcode.isdigit() or len(capcode) > MAX_CAPCODE_LEN:
+            self.send_error(400)
+            return
+        label = label.replace("<", "").replace(">", "").strip()
+        if len(label) > MAX_LABEL_LEN:
+            self.send_error(400)
+            return
+        with _labels_lock:
+            over_cap = (
+                bool(label) and capcode not in _labels and len(_labels) >= MAX_LABELS
+            )
+            if not over_cap:
+                if label:
+                    _labels[capcode] = label
+                else:
+                    _labels.pop(capcode, None)
+                snapshot = dict(_labels)
+                save_labels(snapshot)  # under lock: on-disk order matches memory order
+        if over_cap:
+            self.send_error(400)
+            return
+        data = json.dumps(snapshot).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
 
 
 def main():
     load_npa_nxx()
+    load_labels()
     prime_history()
     threading.Thread(target=tail_log, daemon=True).start()
     server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
