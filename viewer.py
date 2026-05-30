@@ -20,7 +20,8 @@ LABELS_PATH = Path(__file__).resolve().parent / "labels.json"
 MAX_LABEL_LEN = 64
 MAX_CAPCODE_LEN = 10
 MAX_LABELS = 5000
-MAX_POST_BODY = 4096
+MAX_POST_BODY = 65536  # 64 KB: fits a ~8 KB 500-capcode bulk request under the Content-Length guard
+MAX_BULK = 500         # max capcodes[] per bulk POST /labels
 
 _state_lock = threading.Lock()
 _subscribers: list[queue.Queue] = []
@@ -1051,30 +1052,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         try:
             payload = json.loads(self.rfile.read(length))
-            capcode = str(payload["capcode"])
+            if "capcodes" in payload:
+                raw_capcodes = payload["capcodes"]
+                if not isinstance(raw_capcodes, list):
+                    raise TypeError
+            else:
+                raw_capcodes = [payload["capcode"]]
             label = str(payload.get("label", ""))
         except (ValueError, KeyError, TypeError):
             self.send_error(400)
             return
-        capcode = capcode.lstrip("0") or "0"
-        if not capcode.isascii() or not capcode.isdigit() or len(capcode) > MAX_CAPCODE_LEN:
+        if len(raw_capcodes) == 0 or len(raw_capcodes) > MAX_BULK:
             self.send_error(400)
             return
+        capcodes = []
+        for c in raw_capcodes:
+            cc = str(c).lstrip("0") or "0"
+            if not cc.isascii() or not cc.isdigit() or len(cc) > MAX_CAPCODE_LEN:
+                self.send_error(400)
+                return
+            capcodes.append(cc)
         label = label.replace("<", "").replace(">", "").strip()
         if len(label) > MAX_LABEL_LEN:
             self.send_error(400)
             return
         with _labels_lock:
-            over_cap = (
-                bool(label) and capcode not in _labels and len(_labels) >= MAX_LABELS
-            )
+            if label:
+                new_count = len({c for c in capcodes if c not in _labels})
+                over_cap = len(_labels) + new_count > MAX_LABELS
+            else:
+                over_cap = False
             if not over_cap:
-                if label:
-                    _labels[capcode] = label
-                else:
-                    _labels.pop(capcode, None)
+                for cc in capcodes:
+                    if label:
+                        _labels[cc] = label
+                    else:
+                        _labels.pop(cc, None)
                 snapshot = dict(_labels)
-                save_labels(snapshot)  # under lock: on-disk order matches memory order
+                save_labels(snapshot)
         if over_cap:
             self.send_error(400)
             return
