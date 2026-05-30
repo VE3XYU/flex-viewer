@@ -441,6 +441,27 @@ main {
   width: 150px;
 }
 .label-edit:focus { outline: none; }
+.label-edit-group {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 4px;
+  vertical-align: middle;
+}
+.label-edit-group .group-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.label-edit-group .group-row input[type="checkbox"] {
+  accent-color: var(--accent);
+  margin: 0;
+}
+.label-edit-group .group-note {
+  color: var(--muted);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+}
 .badge {
   font-size: 10.5px;
   padding: 1px 7px;
@@ -768,6 +789,7 @@ function makePage(p, fresh) {
   const name = labels[p.capcode];
   const tag = name ? el('span', 'label', name) : el('span', 'tagbtn', '⊕ tag');
   tag.dataset.capcode = p.capcode;
+  tag.dataset.id = p.id;
   meta.appendChild(tag);
   meta.appendChild(el('span', 'badge ' + p.type, p.type));
   if (p._partCount > 1) {
@@ -870,7 +892,7 @@ filterClear.addEventListener('click', () => {
 list.addEventListener('click', (e) => {
   const tag = e.target.closest('.label, .tagbtn');
   if (tag) {
-    startLabelEdit(tag, tag.dataset.capcode);
+    startLabelEdit(tag, tag.dataset.capcode, tag.dataset.id);
     return;
   }
   const cap = e.target.closest('.capcode');
@@ -912,26 +934,70 @@ function saveLabels(capcodes, label) {
     .catch(() => rerender());
 }
 
-function startLabelEdit(spanEl, capcode) {
+function startLabelEdit(spanEl, capcode, pageId) {
+  const page = pages.find(p => String(p.id) === String(pageId));
+  const group = page ? findGroup(page) : [capcode];
+  const isGroup = group.length >= GROUP_MIN_SIZE;
+
+  const wrap = el('div', 'label-edit-group');
   const input = el('input', 'label-edit');
   input.type = 'text';
   input.value = labels[capcode] || '';
   input.placeholder = 'label…';
-  spanEl.replaceWith(input);
+  wrap.appendChild(input);
+
+  let checkbox = null;
+  if (isGroup) {
+    const others = group.filter(c => c !== capcode);
+    const row = el('label', 'group-row');
+    checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = true;
+    row.appendChild(checkbox);
+    const note = el('span', 'group-note', '');
+    // Count only members that currently carry a DIFFERENT non-empty label, i.e.
+    // would actually be re-tagged by the value being typed. Recompute as they type.
+    const updateNote = () => {
+      const val = input.value.trim();
+      const changing = others.filter(c => {
+        const cur = labels[c] || '';
+        return cur !== '' && cur !== val;
+      }).length;
+      let t = 'also tag ' + others.length + ' others in this broadcast';
+      if (changing > 0) t += ' (' + changing + ' will be re-tagged from a different label)';
+      note.textContent = t;
+    };
+    updateNote();
+    input.addEventListener('input', updateNote);
+    row.appendChild(note);
+    wrap.appendChild(row);
+  }
+
+  spanEl.replaceWith(wrap);
   input.focus();
   input.select();
+
   let done = false;
   const finish = (save) => {
     if (done) return;
     done = true;
-    if (save) saveLabel(capcode, input.value.trim());
-    else rerender();
+    if (save) {
+      const val = input.value.trim();
+      if (checkbox && checkbox.checked) saveLabels(group, val);
+      else saveLabel(capcode, val);
+    } else {
+      rerender();
+    }
   };
-  input.addEventListener('keydown', (e) => {
+  wrap.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); finish(true); }
     else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
   });
-  input.addEventListener('blur', () => finish(false));
+  // Cancel only when focus leaves the whole editor — not when it moves to the checkbox.
+  wrap.addEventListener('focusout', (e) => {
+    if (wrap.contains(e.relatedTarget)) return;
+    finish(false);
+  });
 }
 
 function connect() {
