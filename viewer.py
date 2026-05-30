@@ -11,7 +11,7 @@ import webbrowser
 from collections import deque
 from pathlib import Path
 
-LOG_PATH = Path(__file__).resolve().parent / "live.log"
+LOG_PATH = Path(os.environ.get("LOG_PATH", Path(__file__).resolve().parent / "live.log"))
 PORT = 8732
 HISTORY_SIZE = 200
 MAX_BODY = 4096
