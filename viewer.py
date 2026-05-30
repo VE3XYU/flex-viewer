@@ -445,7 +445,6 @@ main {
   display: inline-flex;
   flex-direction: column;
   gap: 4px;
-  vertical-align: middle;
 }
 .label-edit-group .group-row {
   display: inline-flex;
@@ -610,6 +609,7 @@ function findGroup(page) {
   // capcode. Caller checks length >= GROUP_MIN_SIZE.
   if (isTest(page.body)) return [];
   const key = groupKey(page.body);
+  if (!key) return [];
   const seen = new Set();
   const out = [];
   for (const q of pages) {
@@ -949,7 +949,7 @@ function startLabelEdit(spanEl, capcode, pageId) {
   let checkbox = null;
   if (isGroup) {
     const others = group.filter(c => c !== capcode);
-    const row = el('label', 'group-row');
+    const row = el('div', 'group-row');
     checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
     checkbox.checked = true;
