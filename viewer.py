@@ -536,6 +536,8 @@ const pages = [];
 let filter = '';
 let labels = {};  // capcode -> name, fetched from /labels
 const STITCH_WINDOW_MS = 8000;
+const GROUP_TIME_WINDOW = 60;  // seconds (ts is HH:MM:SS) — broadcast co-recipient window
+const GROUP_MIN_SIZE = 3;      // distinct capcodes to count as a group, not a coincidence
 
 const ALL_TYPES = ['ALN', 'NUM', 'TON', 'TEST'];
 const STORAGE_KEY = 'flexViewer.enabledTypes';
@@ -566,6 +568,39 @@ function frameDistance(a, b) {
   let d = Math.abs(ai - bi);
   if (d > span / 2) d = span - d;
   return d;
+}
+
+function groupKey(s) {
+  // Normalize a body so byte-identical broadcasts match despite whitespace jitter.
+  return s.trim().replace(/\s+/g, ' ');
+}
+
+function tsDistance(a, b) {
+  // Wrap-aware distance in seconds between two "HH:MM:SS" stamps (handles midnight).
+  const toSec = (t) => { const p = t.split(':').map(Number); return p[0] * 3600 + p[1] * 60 + p[2]; };
+  let d = Math.abs(toSec(a) - toSec(b));
+  if (d > 43200) d = 86400 - d;
+  return d;
+}
+
+function findGroup(page) {
+  // Distinct capcodes that received the same broadcast as `page` (identical body
+  // within GROUP_TIME_WINDOW seconds). Excludes TEST pages. Includes page's own
+  // capcode. Caller checks length >= GROUP_MIN_SIZE.
+  if (isTest(page.body)) return [];
+  const key = groupKey(page.body);
+  const seen = new Set();
+  const out = [];
+  for (const q of pages) {
+    if (isTest(q.body)) continue;
+    if (groupKey(q.body) !== key) continue;
+    if (tsDistance(q.ts, page.ts) > GROUP_TIME_WINDOW) continue;
+    if (seen.has(q.capcode)) continue;
+    seen.add(q.capcode);
+    out.push(q.capcode);
+  }
+  if (!seen.has(page.capcode)) out.push(page.capcode);
+  return out;
 }
 
 function looksComplete(body) {
@@ -860,6 +895,17 @@ function saveLabel(capcode, label) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ capcode: capcode, label: label }),
+  })
+    .then(r => (r.ok ? r.json() : null))
+    .then(data => { if (data) labels = data; rerender(); })
+    .catch(() => rerender());
+}
+
+function saveLabels(capcodes, label) {
+  fetch('/labels', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ capcodes: capcodes, label: label }),
   })
     .then(r => (r.ok ? r.json() : null))
     .then(data => { if (data) labels = data; rerender(); })
