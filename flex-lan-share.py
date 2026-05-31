@@ -7,16 +7,33 @@ Forwards <LAN-IP>:8732 -> 127.0.0.1:8732 as a TCP relay. For the main page
 way through; SSE (/stream), /labels, and everything else pass through raw and
 unbuffered. The running viewer is never touched.
 
-  python3 ~/flex-lan-share.py            # bind LAN IP : 8732
-  LAN_PORT=8080 python3 ~/flex-lan-share.py
+The HTML injection only fires for a clean single GET / whose upstream response
+is identity-encoded with a numeric Content-Length (the only shape viewer.py
+sends). Any other response -- chunked, gzipped, no Content-Length, or a
+connection carrying pipelined requests -- is relayed byte-for-byte untouched,
+so the relay can never mis-frame a response it doesn't fully understand.
+
+Tagging stays host-only: the viewer's POST /labels has a localhost Host/Origin
+guard, and the relay forwards the client's original (LAN) Host, so LAN clients
+are view-only (writes get 403). Keep this up only on a network you trust --
+the feed carries real paging traffic.
+
+  python3 flex-lan-share.py              # bind LAN IP : 8732
+  LAN_PORT=8080 python3 flex-lan-share.py
 """
 import os
 import re
 import socket
+import sys
 import threading
 
 TARGET = ("127.0.0.1", 8732)
 LISTEN_PORT = int(os.environ.get("LAN_PORT", "8732"))
+MAX_HEADER = 65536          # cap on a single HTTP message head we'll buffer
+IDLE_TIMEOUT = 60           # seconds a relayed socket may block before teardown
+MAX_CONNS = 64              # live connections cap (slow-loris / fd backstop)
+
+_slots = threading.BoundedSemaphore(MAX_CONNS)
 
 # Injected before </head> on the GET / response. Media query => desktop view
 # is unchanged; only narrow (phone) screens get the overrides. The 16px input
@@ -41,6 +58,8 @@ INJECT = (
 
 
 def lan_ip():
+    # No traffic is sent; connecting a UDP socket just selects the egress
+    # interface so getsockname() reveals this host's LAN address.
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
@@ -50,31 +69,38 @@ def lan_ip():
 
 
 def read_head(sock):
-    """Read up to (and incl.) the \\r\\n\\r\\n header terminator.
-    Returns (head_bytes, leftover_bytes_after_headers)."""
+    """Read until the \\r\\n\\r\\n header terminator.
+
+    Returns (head_incl_terminator, leftover_bytes_after_it). If no terminator
+    arrives within MAX_HEADER bytes or the peer closes first, returns
+    (b"", b"") so the caller can drop the connection rather than forward a
+    truncated/garbage message (which would desync the upstream parser).
+    """
     buf = b""
     while b"\r\n\r\n" not in buf:
         chunk = sock.recv(4096)
         if not chunk:
             break
         buf += chunk
-        if len(buf) > 65536:
+        if len(buf) > MAX_HEADER:
             break
     i = buf.find(b"\r\n\r\n")
     if i == -1:
-        return buf, b""
+        return b"", b""
     return buf[: i + 4], buf[i + 4:]
 
 
 def header_value(head, name):
     m = re.search(rb"(?im)^" + re.escape(name) + rb":[ \t]*([^\r\n]*)\r\n", head)
-    return m.group(1) if m else b""
+    return m.group(1).strip() if m else b""
 
 
 def set_content_length(head, n):
+    # Only called on the inject path, where header_value already confirmed a
+    # numeric Content-Length exists, so the subn always matches.
     repl = ("Content-Length: %d\r\n" % n).encode()
-    new, count = re.subn(rb"(?im)^content-length:[^\r\n]*\r\n", repl, head, count=1)
-    return new if count else head[:-2] + repl + b"\r\n"
+    new, _ = re.subn(rb"(?im)^content-length:[^\r\n]*\r\n", repl, head, count=1)
+    return new
 
 
 def pump(src, dst):
@@ -100,39 +126,58 @@ def pump_both(a, b):
     t.join()
 
 
+def _reframmable(rhead):
+    """True if we may safely rewrite this response body + Content-Length:
+    identity encoding, no chunking, numeric Content-Length present."""
+    if header_value(rhead, b"Transfer-Encoding"):
+        return False
+    if header_value(rhead, b"Content-Encoding"):
+        return False
+    return header_value(rhead, b"Content-Length").isdigit()
+
+
 def handle(client):
+    if not _slots.acquire(blocking=False):
+        try:
+            client.close()
+        except OSError:
+            pass
+        return
     up = None
     try:
+        client.settimeout(IDLE_TIMEOUT)
         head, extra = read_head(client)
         if not head:
-            return
+            return  # no complete request head -> drop
         try:
             line = head.split(b"\r\n", 1)[0].decode("latin1").split(" ")
             method, path = line[0], line[1]
         except Exception:
             method, path = "", ""
         up = socket.create_connection(TARGET, timeout=5)
+        up.settimeout(IDLE_TIMEOUT)
         up.sendall(head + extra)
 
-        if method == "GET" and path in ("/", "/index.html"):
-            try:
-                rhead, rbody = read_head(up)
-                ctype = header_value(rhead, b"Content-Type")
-                cl = header_value(rhead, b"Content-Length")
-                if cl.isdigit():
-                    need = int(cl)
-                    while len(rbody) < need:
-                        chunk = up.recv(65536)
-                        if not chunk:
-                            break
-                        rbody += chunk
-                if b"text/html" in ctype.lower() and b"</head>" in rbody:
+        # Inject ONLY on a clean, single GET / (no pipelined/body bytes in
+        # `extra`) whose upstream response we can safely reframe. Everything
+        # else -- /stream, /labels, POSTs, pipelined or odd-encoded responses
+        # -- is relayed raw and untouched.
+        if method == "GET" and path in ("/", "/index.html") and extra == b"":
+            rhead, rbody = read_head(up)
+            if rhead and _reframmable(rhead):
+                need = int(header_value(rhead, b"Content-Length"))
+                while len(rbody) < need:
+                    chunk = up.recv(65536)
+                    if not chunk:
+                        break
+                    rbody += chunk
+                ctype = header_value(rhead, b"Content-Type").lower()
+                if b"text/html" in ctype and b"</head>" in rbody:
                     rbody = rbody.replace(b"</head>", INJECT + b"</head>", 1)
                     rhead = set_content_length(rhead, len(rbody))
                 client.sendall(rhead + rbody)
-            except Exception:
-                pass  # injection failed; the connection just continues raw below
-        # Pass through anything else (and any keep-alive follow-ups) raw.
+            elif rhead:
+                client.sendall(rhead + rbody)  # not reframmable: pass raw
         pump_both(client, up)
     except OSError:
         pass
@@ -143,10 +188,14 @@ def handle(client):
                     s.close()
             except OSError:
                 pass
+        _slots.release()
 
 
 def main():
-    ip = lan_ip()
+    try:
+        ip = lan_ip()
+    except OSError:
+        sys.exit("no LAN interface found (no route to network?)")
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((ip, LISTEN_PORT))

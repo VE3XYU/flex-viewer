@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Convert the FLEX decode log into a spreadsheet (.xlsx + .csv).
 
-Reuses viewer.py's own parser so rows match exactly what the live feed shows
-(same record splitting, capcode normalization, body handling). Joins each row
-with its capcode label from labels.json, and adds a callback-town hints column
-from the bundled NPA-NXX data.
+Reuses viewer.py's parser so capcode/body/field handling matches the live feed.
+Note: multi-fragment ALN messages are emitted as one row per OTA fragment (the
+live UI stitches them into a single "N parts" page; this export does not).
+Joins each row with its capcode label from labels.json, and adds a
+callback-town hints column from the bundled NPA-NXX data.
 
   python3 log_to_xlsx.py                 # -> ./flex-log-<timestamp>.xlsx + .csv
   python3 log_to_xlsx.py /path/to/out    # -> /path/to/out.xlsx + .csv
@@ -36,6 +37,22 @@ COLUMNS = ["Date", "Time", "Capcode", "Label", "Type", "Mode",
 # XML 1.0 forbids most control chars; strip them so the .xlsx stays valid.
 _ILLEGAL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
+# Spreadsheet formula-injection guard. Page bodies are attacker-influenceable
+# (anyone can transmit a FLEX page), and Excel/Numbers/LibreOffice treat a
+# cell beginning with = + - @ (or a leading tab/CR) as a live formula when a
+# CSV is opened -- so "=HYPERLINK(...)"/"=cmd|..." in a body would execute.
+# Prefix such values with a single quote, the standard CSV-injection defense,
+# which the app shows as plain text. (The .xlsx path is already safe: cells are
+# written as inlineStr text, never formulas -- this guard is for the .csv.)
+_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(val):
+    s = str(val)
+    if s and s[0] in _FORMULA_LEAD:
+        return "'" + s
+    return s
+
 
 def _esc(s):
     s = _ILLEGAL.sub("", s)
@@ -56,22 +73,24 @@ def read_records():
         sys.exit("log not found: %s" % log)
     viewer.load_npa_nxx()  # so parse_record fills the hints column
     try:
-        labels = json.load(open(viewer.LABELS_PATH))
+        with open(viewer.LABELS_PATH, encoding="utf-8") as f:
+            labels = json.load(f)
         if not isinstance(labels, dict):
             labels = {}
     except Exception:
         labels = {}
     records, buf = [], []
-    for line in open(log, "r", errors="replace"):
-        line = line.rstrip("\n")
-        if viewer.HEADER_RE.match(line):
-            if buf:
-                rec = viewer.parse_record("\n".join(buf))
-                if rec:
-                    records.append(rec)
-            buf = [line]
-        elif buf:
-            buf.append(line)
+    with open(log, "r", errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if viewer.HEADER_RE.match(line):
+                if buf:
+                    rec = viewer.parse_record("\n".join(buf))
+                    if rec:
+                        records.append(rec)
+                buf = [line]
+            elif buf:
+                buf.append(line)
     if buf:
         rec = viewer.parse_record("\n".join(buf))
         if rec:
@@ -87,11 +106,13 @@ def row_for(rec, labels):
 
 
 def write_csv(path, rows):
-    # utf-8-sig so Excel reads accents correctly on open
+    # utf-8-sig so Excel reads accents correctly on open. Every value is run
+    # through _csv_safe to neutralize spreadsheet formula injection.
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(COLUMNS)
-        w.writerows(rows)
+        for r in rows:
+            w.writerow([_csv_safe(v) for v in r])
 
 
 def _sheet_xml(rows):
@@ -193,12 +214,18 @@ def validate_xlsx(path, expected_rows):
 
 
 def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     if len(sys.argv) > 1:
         base = os.path.abspath(os.path.expanduser(sys.argv[1]))
+        # The .gitignore safety net only covers the project dir. Warn (don't
+        # block) if the operator aims a PHI-bearing export elsewhere.
+        if os.path.commonpath([base, script_dir]) != script_dir:
+            print("warning: writing PHI export outside the project dir (%s) -- "
+                  "not gitignored there; keep it local" % os.path.dirname(base),
+                  file=sys.stderr)
     else:
         # Default: write next to this script (the project dir). *.csv/*.xlsx are
         # gitignored, so the PHI-bearing export can't be committed.
-        script_dir = os.path.dirname(os.path.abspath(__file__))
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         base = os.path.join(script_dir, "flex-log-" + stamp)
     records, labels, log = read_records()
@@ -210,8 +237,8 @@ def main():
     write_csv(csv_path, rows)
     rc = validate_xlsx(xlsx_path, len(rows))
 
-    tagged = sum(1 for r in rows if r[3])
-    with_hints = sum(1 for r in rows if r[8])
+    tagged = sum(1 for r in records if labels.get(r["capcode"]))
+    with_hints = sum(1 for r in records if r.get("hints"))
     print("source log     : %s (%.1f KB)" % (log, log.stat().st_size / 1024))
     print("records         : %d" % len(rows))
     print("  with a label  : %d" % tagged)
