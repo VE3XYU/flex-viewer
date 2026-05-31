@@ -118,6 +118,13 @@ python3 viewer.py   # viewer in foreground
   reclassified as NUM so toggling that one chip hides them all.
 - **Click-to-filter** — clicking any capcode fills the text filter
   with it. Clear the filter to see everything again.
+- **Capcode labels** — click the `⊕ tag` next to any capcode to name it
+  (e.g. an institution). Labels persist server-side in `labels.json`, show
+  inline, and are searchable from the filter box, so typing a name surfaces
+  every capcode you've given it.
+- **Callback hints** — phone numbers in a page body are annotated with their
+  town, looked up from a bundled Ontario NPA-NXX dataset. Useful for guessing
+  which institution a page is for on a shared simulcast channel.
 - **Free-text filter** — searches both capcode and message body.
 - **Multi-fragment re-stitching** — FLEX caps a single page at ~248
   characters; long medical/SCADA messages get fragmented across
@@ -141,9 +148,18 @@ Edit the constants near the top of `viewer.py`:
 | `PORT`         | `8732` (binds 127.0.0.1 only)            |
 | `HISTORY_SIZE` | `200` pages buffered for new connections |
 | `MAX_BODY`     | `4096` chars per page body               |
+| `LABELS_PATH`  | `labels.json` next to `viewer.py`        |
 
 `STITCH_WINDOW_MS` (in the JS block) controls the live-stitching
 window — 8000 ms by default.
+
+The callback-hint dataset lives in `data/npa-nxx-on.json` (Ontario only).
+Regenerate it from the Canadian Numbering Administrator with:
+
+```bash
+python3 build_npa_nxx.py          # refresh data/npa-nxx-on.json
+python3 build_npa_nxx.py --check  # offline self-tests
+```
 
 The decoder log path is also overridable via env vars when launching:
 

@@ -2,6 +2,7 @@
 """FLEX live page viewer — tails live.log, serves a local web UI."""
 import http.server
 import json
+import os
 import queue
 import re
 import threading
@@ -10,16 +11,25 @@ import webbrowser
 from collections import deque
 from pathlib import Path
 
-LOG_PATH = Path(__file__).resolve().parent / "live.log"
+LOG_PATH = Path(os.environ.get("LOG_PATH", Path(__file__).resolve().parent / "live.log"))
 PORT = 8732
 HISTORY_SIZE = 200
 MAX_BODY = 4096
+NPA_NXX_PATH = Path(__file__).resolve().parent / "data" / "npa-nxx-on.json"
+LABELS_PATH = Path(__file__).resolve().parent / "labels.json"
+MAX_LABEL_LEN = 64
+MAX_CAPCODE_LEN = 10
+MAX_LABELS = 5000
+MAX_POST_BODY = 4096
 
 _state_lock = threading.Lock()
 _subscribers: list[queue.Queue] = []
 _history: deque = deque(maxlen=HISTORY_SIZE)
 _next_id = 0
 _id_lock = threading.Lock()
+_npa_nxx: dict[str, str] = {}  # "905201" -> "Markham, ON"; loaded once in main()
+_labels_lock = threading.Lock()
+_labels: dict[str, str] = {}  # "1234567" -> "Southlake"
 
 
 def alloc_id() -> int:
@@ -27,6 +37,61 @@ def alloc_id() -> int:
     with _id_lock:
         _next_id += 1
         return _next_id
+
+
+def load_npa_nxx() -> None:
+    """Load+invert the bundled NPA-NXX table. Missing file disables hints."""
+    global _npa_nxx
+    table = {}
+    try:
+        with NPA_NXX_PATH.open("r", encoding="utf-8") as f:
+            grouped = json.load(f)
+        for place, codes in grouped.items():
+            for code in codes:
+                table[code] = place
+    except Exception:
+        _npa_nxx = {}
+        return
+    _npa_nxx = table
+
+
+def phone_hints(body: str) -> list:
+    """Detect NANP numbers in body and map NPA-NXX -> town. Best-effort."""
+    if not _npa_nxx:
+        return []
+    hints = []
+    seen = set()
+    for m in PHONE_RE.finditer(body):
+        place = _npa_nxx.get(m.group(1) + m.group(2))
+        if not place:
+            continue
+        num = m.group(0).strip()
+        if num in seen:
+            continue
+        seen.add(num)
+        hints.append({"num": num, "place": place})
+    return hints
+
+
+def load_labels() -> None:
+    global _labels
+    try:
+        with LABELS_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    with _labels_lock:
+        _labels = {(str(k).lstrip("0") or "0"): str(v) for k, v in data.items()}
+
+
+def save_labels(snapshot: dict) -> None:
+    """Atomic write: temp file in the same dir, then os.replace()."""
+    tmp = LABELS_PATH.with_name(LABELS_PATH.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(snapshot, f, ensure_ascii=False)
+    os.replace(tmp, LABELS_PATH)
 
 
 PIPE_RE = re.compile(
@@ -41,6 +106,11 @@ LEGACY_RE = re.compile(
     r"(?P<type>\S+) (?P<body>.*)$"
 )
 HEADER_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}: FLEX")
+# NANP 10-digit number in free text. Group 1 = NPA, group 2 = NXX.
+# Lookarounds reject digit runs, FLEX frames (12.045) and hyphen ranges.
+PHONE_RE = re.compile(
+    r"(?<![\w.\-])(?:\+?1[ .\-]?)?\(?([2-9]\d{2})\)?[ .\-]?([2-9]\d{2})[ .\-]?(\d{4})(?![\w.\-])"
+)
 
 
 def parse_record(text: str):
@@ -68,6 +138,7 @@ def parse_record(text: str):
         "capcode": d["capcode"].lstrip("0") or "0",
         "type": d["type"],
         "body": body,
+        "hints": phone_hints(body),
     }
 
 
@@ -337,6 +408,38 @@ main {
   transition: background 100ms;
 }
 .capcode:hover { background: rgba(255, 155, 64, 0.14); }
+.label {
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 500;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 100ms, border-color 120ms;
+}
+.label:hover { background: rgba(255, 155, 64, 0.14); border-color: var(--accent); }
+.tagbtn {
+  color: var(--dim);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 140ms, color 120ms;
+}
+.page:hover .tagbtn { opacity: 0.55; }
+.tagbtn:hover { color: var(--text); opacity: 1; }
+.label-edit {
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11px;
+  padding: 1px 6px;
+  width: 150px;
+}
+.label-edit:focus { outline: none; }
 .badge {
   font-size: 10.5px;
   padding: 1px 7px;
@@ -380,6 +483,17 @@ main {
 }
 .body font { font-family: inherit; }
 .body b, .body strong { color: #fff; font-weight: 600; }
+.hints {
+  padding-left: 14px;
+  margin-left: 2px;
+  margin-top: 6px;
+}
+.hint {
+  color: var(--muted);
+  font-family: 'IBM Plex Mono', ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+}
 .empty {
   padding: 96px 0;
   text-align: center;
@@ -419,6 +533,7 @@ const SANITIZE_CONFIG = {
 
 const pages = [];
 let filter = '';
+let labels = {};  // capcode -> name, fetched from /labels
 const STITCH_WINDOW_MS = 8000;
 
 const ALL_TYPES = ['ALN', 'NUM', 'TON', 'TEST'];
@@ -499,7 +614,8 @@ function bucket(p) {
 function matches(p) {
   if (!enabledTypes.has(bucket(p))) return false;
   if (!filter) return true;
-  return p.capcode.includes(filter) || p.body.toLowerCase().includes(filter);
+  const lbl = (labels[p.capcode] || '').toLowerCase();
+  return p.capcode.includes(filter) || p.body.toLowerCase().includes(filter) || lbl.includes(filter);
 }
 
 function refreshChipCounts() {
@@ -613,6 +729,10 @@ function makePage(p, fresh) {
   const meta = el('div', 'meta');
   meta.appendChild(el('span', 'ts', p.ts));
   meta.appendChild(el('span', 'capcode', p.capcode));
+  const name = labels[p.capcode];
+  const tag = name ? el('span', 'label', name) : el('span', 'tagbtn', '⊕ tag');
+  tag.dataset.capcode = p.capcode;
+  meta.appendChild(tag);
   meta.appendChild(el('span', 'badge ' + p.type, p.type));
   if (p._partCount > 1) {
     meta.appendChild(el('span', 'parts', p._partCount + ' parts'));
@@ -623,6 +743,11 @@ function makePage(p, fresh) {
   }
   article.appendChild(meta);
   article.appendChild(renderBody(p.body));
+  if (p.hints && p.hints.length) {
+    const hintsEl = el('div', 'hints');
+    p.hints.forEach(h => hintsEl.appendChild(el('div', 'hint', '↳ ' + h.num + ' — ' + h.place)));
+    article.appendChild(hintsEl);
+  }
   return article;
 }
 
@@ -661,6 +786,9 @@ function addPage(p) {
     target.body = target.body + p.body;
     target._partCount = (target._partCount || 1) + 1;
     target._receivedAt = p._receivedAt;
+    if (p.hints && p.hints.length) {
+      target.hints = (target.hints || []).concat(p.hints);
+    }
     if (matches(target)) {
       const existing = list.querySelector('[data-id="' + target.id + '"]');
       if (existing) {
@@ -704,6 +832,11 @@ filterClear.addEventListener('click', () => {
 });
 
 list.addEventListener('click', (e) => {
+  const tag = e.target.closest('.label, .tagbtn');
+  if (tag) {
+    startLabelEdit(tag, tag.dataset.capcode);
+    return;
+  }
   const cap = e.target.closest('.capcode');
   if (!cap) return;
   const code = cap.textContent.trim();
@@ -713,6 +846,46 @@ list.addEventListener('click', (e) => {
   syncClearVisibility();
   rerender();
 });
+
+function loadLabels() {
+  fetch('/labels')
+    .then(r => (r.ok ? r.json() : {}))
+    .then(data => { labels = data || {}; rerender(); })
+    .catch(() => {});
+}
+
+function saveLabel(capcode, label) {
+  fetch('/labels', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ capcode: capcode, label: label }),
+  })
+    .then(r => (r.ok ? r.json() : null))
+    .then(data => { if (data) labels = data; rerender(); })
+    .catch(() => rerender());
+}
+
+function startLabelEdit(spanEl, capcode) {
+  const input = el('input', 'label-edit');
+  input.type = 'text';
+  input.value = labels[capcode] || '';
+  input.placeholder = 'label…';
+  spanEl.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = (save) => {
+    if (done) return;
+    done = true;
+    if (save) saveLabel(capcode, input.value.trim());
+    else rerender();
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  });
+  input.addEventListener('blur', () => finish(false));
+}
 
 function connect() {
   const src = new EventSource('/stream');
@@ -737,6 +910,9 @@ function connect() {
       if (target) {
         target.body = target.body + p.body;
         target._partCount = (target._partCount || 1) + 1;
+        if (p.hints && p.hints.length) {
+          target.hints = (target.hints || []).concat(p.hints);
+        }
       } else {
         stitched.push(Object.assign({}, p, { _partCount: 1 }));
       }
@@ -747,6 +923,7 @@ function connect() {
   src.onmessage = e => addPage(JSON.parse(e.data));
 }
 
+loadLabels();
 connect();
 """
 
@@ -836,10 +1013,83 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if q in _subscribers:
                         _subscribers.remove(q)
             return
+        if self.path == "/labels":
+            with _labels_lock:
+                data = json.dumps(dict(_labels)).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         self.send_error(404)
+
+    def do_POST(self):
+        if self.path != "/labels":
+            self.send_error(404)
+            return
+        # Local-only: reject anything not addressed to this loopback host.
+        allowed = ("127.0.0.1:%d" % PORT, "localhost:%d" % PORT)
+        if self.headers.get("Host", "") not in allowed:
+            self.send_error(403)
+            return
+        origin = self.headers.get("Origin")
+        if origin is None or not any(origin == "http://" + h for h in allowed):
+            self.send_error(403)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.send_error(400)
+            return
+        if length <= 0:
+            self.send_error(400)
+            return
+        if length > MAX_POST_BODY:
+            self.send_error(413)
+            return
+        try:
+            payload = json.loads(self.rfile.read(length))
+            capcode = str(payload["capcode"])
+            label = str(payload.get("label", ""))
+        except (ValueError, KeyError, TypeError):
+            self.send_error(400)
+            return
+        capcode = capcode.lstrip("0") or "0"
+        if not capcode.isascii() or not capcode.isdigit() or len(capcode) > MAX_CAPCODE_LEN:
+            self.send_error(400)
+            return
+        label = label.replace("<", "").replace(">", "").strip()
+        if len(label) > MAX_LABEL_LEN:
+            self.send_error(400)
+            return
+        with _labels_lock:
+            over_cap = (
+                bool(label) and capcode not in _labels and len(_labels) >= MAX_LABELS
+            )
+            if not over_cap:
+                if label:
+                    _labels[capcode] = label
+                else:
+                    _labels.pop(capcode, None)
+                snapshot = dict(_labels)
+                save_labels(snapshot)  # under lock: on-disk order matches memory order
+        if over_cap:
+            self.send_error(400)
+            return
+        data = json.dumps(snapshot).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
 
 
 def main():
+    load_npa_nxx()
+    load_labels()
     prime_history()
     threading.Thread(target=tail_log, daemon=True).start()
     server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)

@@ -46,7 +46,8 @@ primes from history on startup, then tails for new lines).
   is `ThreadingHTTPServer`, one thread per subscriber; broadcast fan-out is a
   per-subscriber `queue.Queue` guarded by `_state_lock`.
 - **`render_html()`** returns the entire UI (CSS + JS) inline. There is no
-  static file serving — `/` returns HTML and `/stream` returns SSE; everything
+  static file serving — `/` returns HTML, `/stream` returns SSE, and
+  `/labels` serves (GET) and updates (POST) the capcode-label store; everything
   else 404s. DOMPurify is loaded from jsDelivr.
 
 Config lives as constants at the top of `viewer.py` (`LOG_PATH`, `PORT`,
@@ -92,6 +93,24 @@ The non-obvious behavior is concentrated in three places:
 
 State that persists: `enabledTypes` in `localStorage` under
 `flexViewer.enabledTypes`.
+
+### Capcode labels and callback hints
+
+- **Labels** are a `capcode → name` map. They live server-side in
+  `labels.json` (atomic writes), are served by `GET /labels`, and updated by
+  `POST /labels` ({"capcode","label"}; empty label deletes). The client holds a
+  `labels` object, fetched once via `loadLabels()`, and re-renders all pages on
+  change. Keys use the same leading-zero-stripped capcode form as the feed. The
+  POST handler is localhost-only (Host/Origin guard), validates capcode (digits,
+  ≤10) and label (≤64, `<`/`>` stripped), and caps total labels.
+- **Callback hints** are computed server-side: `phone_hints()` runs `PHONE_RE`
+  over the body and maps NPA-NXX → town via `_npa_nxx`, attached as `rec["hints"]`
+  in `parse_record` (covers history + live). The table is loaded once by
+  `load_npa_nxx()` in `main()` (read-only, no lock); a missing
+  `data/npa-nxx-on.json` silently disables hints. Regenerate the dataset with
+  `python3 build_npa_nxx.py` (pulls CNAC per-NPA CSVs); `--check` runs offline
+  self-tests. Labels and hints render via the `el()` helper (textContent only),
+  never through DOMPurify.
 
 ## Things to know before changing parser regexes
 
