@@ -150,7 +150,7 @@ Edit the constants near the top of `viewer.py`:
 | -------------- | ---------------------------------------- |
 | `LOG_PATH`     | `~/Documents/flex waves/live.log`        |
 | `PORT`         | `8732` (binds 127.0.0.1 only)            |
-| `HISTORY_SIZE` | `200` pages buffered for new connections |
+| `HISTORY_SIZE` | `500` pages buffered for new connections |
 | `MAX_BODY`     | `4096` chars per page body               |
 | `LABELS_PATH`  | `labels.json` next to `viewer.py`        |
 

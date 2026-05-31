@@ -1,10 +1,23 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# macOS
 .DS_Store
-*.log
+
+# Decoder audio + logs (real paging traffic — may contain PHI)
 *.wav
 *.flac
 *.raw
+*.log
+*.log.*
+logs/
+
+# Operator's capcode label map (institution names — keep local)
 labels.json
+
+# Log exports (real traffic — never commit; written into the project dir)
+*.csv
+*.xlsx
