@@ -125,6 +125,10 @@ python3 viewer.py   # viewer in foreground
 - **Callback hints** — phone numbers in a page body are annotated with their
   town, looked up from a bundled Ontario NPA-NXX dataset. Useful for guessing
   which institution a page is for on a shared simulcast channel.
+- **Group tagging** — a single broadcast (e.g. a trauma team activation) goes
+  out to a whole team's pagers at once. When you tag a capcode that's part of
+  such a broadcast, the editor offers to label every co-recipient in one action,
+  so one edit maps an entire team.
 - **Free-text filter** — searches both capcode and message body.
 - **Multi-fragment re-stitching** — FLEX caps a single page at ~248
   characters; long medical/SCADA messages get fragmented across

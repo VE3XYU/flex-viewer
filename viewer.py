@@ -20,7 +20,8 @@ LABELS_PATH = Path(__file__).resolve().parent / "labels.json"
 MAX_LABEL_LEN = 64
 MAX_CAPCODE_LEN = 10
 MAX_LABELS = 5000
-MAX_POST_BODY = 4096
+MAX_POST_BODY = 65536  # 64 KB: fits a ~8 KB 500-capcode bulk request under the Content-Length guard
+MAX_BULK = 500         # max capcodes[] per bulk POST /labels
 
 _state_lock = threading.Lock()
 _subscribers: list[queue.Queue] = []
@@ -440,6 +441,26 @@ main {
   width: 150px;
 }
 .label-edit:focus { outline: none; }
+.label-edit-group {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.label-edit-group .group-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.label-edit-group .group-row input[type="checkbox"] {
+  accent-color: var(--accent);
+  margin: 0;
+}
+.label-edit-group .group-note {
+  color: var(--muted);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+}
 .badge {
   font-size: 10.5px;
   padding: 1px 7px;
@@ -535,6 +556,8 @@ const pages = [];
 let filter = '';
 let labels = {};  // capcode -> name, fetched from /labels
 const STITCH_WINDOW_MS = 8000;
+const GROUP_TIME_WINDOW = 60;  // seconds (ts is HH:MM:SS) — broadcast co-recipient window
+const GROUP_MIN_SIZE = 3;      // distinct capcodes to count as a group, not a coincidence
 
 const ALL_TYPES = ['ALN', 'NUM', 'TON', 'TEST'];
 const STORAGE_KEY = 'flexViewer.enabledTypes';
@@ -565,6 +588,40 @@ function frameDistance(a, b) {
   let d = Math.abs(ai - bi);
   if (d > span / 2) d = span - d;
   return d;
+}
+
+function groupKey(s) {
+  // Normalize a body so byte-identical broadcasts match despite whitespace jitter.
+  return s.trim().replace(/\s+/g, ' ');
+}
+
+function tsDistance(a, b) {
+  // Wrap-aware distance in seconds between two "HH:MM:SS" stamps (handles midnight).
+  const toSec = (t) => { const p = t.split(':').map(Number); return p[0] * 3600 + p[1] * 60 + p[2]; };
+  let d = Math.abs(toSec(a) - toSec(b));
+  if (d > 43200) d = 86400 - d;
+  return d;
+}
+
+function findGroup(page) {
+  // Distinct capcodes that received the same broadcast as `page` (identical body
+  // within GROUP_TIME_WINDOW seconds). Excludes TEST pages. Includes page's own
+  // capcode. Caller checks length >= GROUP_MIN_SIZE.
+  if (isTest(page.body)) return [];
+  const key = groupKey(page.body);
+  if (!key) return [];
+  const seen = new Set();
+  const out = [];
+  for (const q of pages) {
+    if (isTest(q.body)) continue;
+    if (groupKey(q.body) !== key) continue;
+    if (tsDistance(q.ts, page.ts) > GROUP_TIME_WINDOW) continue;
+    if (seen.has(q.capcode)) continue;
+    seen.add(q.capcode);
+    out.push(q.capcode);
+  }
+  if (!seen.has(page.capcode)) out.push(page.capcode);
+  return out;
 }
 
 function looksComplete(body) {
@@ -732,6 +789,7 @@ function makePage(p, fresh) {
   const name = labels[p.capcode];
   const tag = name ? el('span', 'label', name) : el('span', 'tagbtn', '⊕ tag');
   tag.dataset.capcode = p.capcode;
+  tag.dataset.id = p.id;
   meta.appendChild(tag);
   meta.appendChild(el('span', 'badge ' + p.type, p.type));
   if (p._partCount > 1) {
@@ -834,7 +892,7 @@ filterClear.addEventListener('click', () => {
 list.addEventListener('click', (e) => {
   const tag = e.target.closest('.label, .tagbtn');
   if (tag) {
-    startLabelEdit(tag, tag.dataset.capcode);
+    startLabelEdit(tag, tag.dataset.capcode, tag.dataset.id);
     return;
   }
   const cap = e.target.closest('.capcode');
@@ -865,26 +923,81 @@ function saveLabel(capcode, label) {
     .catch(() => rerender());
 }
 
-function startLabelEdit(spanEl, capcode) {
+function saveLabels(capcodes, label) {
+  fetch('/labels', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ capcodes: capcodes, label: label }),
+  })
+    .then(r => (r.ok ? r.json() : null))
+    .then(data => { if (data) labels = data; rerender(); })
+    .catch(() => rerender());
+}
+
+function startLabelEdit(spanEl, capcode, pageId) {
+  const page = pages.find(p => String(p.id) === String(pageId));
+  const group = page ? findGroup(page) : [capcode];
+  const isGroup = group.length >= GROUP_MIN_SIZE;
+
+  const wrap = el('div', 'label-edit-group');
   const input = el('input', 'label-edit');
   input.type = 'text';
   input.value = labels[capcode] || '';
   input.placeholder = 'label…';
-  spanEl.replaceWith(input);
+  wrap.appendChild(input);
+
+  let checkbox = null;
+  if (isGroup) {
+    const others = group.filter(c => c !== capcode);
+    const row = el('div', 'group-row');
+    checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = true;
+    row.appendChild(checkbox);
+    const note = el('span', 'group-note', '');
+    // Count only members that currently carry a DIFFERENT non-empty label, i.e.
+    // would actually be re-tagged by the value being typed. Recompute as they type.
+    const updateNote = () => {
+      const val = input.value.trim();
+      const changing = others.filter(c => {
+        const cur = labels[c] || '';
+        return cur !== '' && cur !== val;
+      }).length;
+      let t = 'also tag ' + others.length + ' others in this broadcast';
+      if (changing > 0) t += ' (' + changing + ' will be re-tagged from a different label)';
+      note.textContent = t;
+    };
+    updateNote();
+    input.addEventListener('input', updateNote);
+    row.appendChild(note);
+    wrap.appendChild(row);
+  }
+
+  spanEl.replaceWith(wrap);
   input.focus();
   input.select();
+
   let done = false;
   const finish = (save) => {
     if (done) return;
     done = true;
-    if (save) saveLabel(capcode, input.value.trim());
-    else rerender();
+    if (save) {
+      const val = input.value.trim();
+      if (checkbox && checkbox.checked) saveLabels(group, val);
+      else saveLabel(capcode, val);
+    } else {
+      rerender();
+    }
   };
-  input.addEventListener('keydown', (e) => {
+  wrap.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); finish(true); }
     else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
   });
-  input.addEventListener('blur', () => finish(false));
+  // Cancel only when focus leaves the whole editor — not when it moves to the checkbox.
+  wrap.addEventListener('focusout', (e) => {
+    if (wrap.contains(e.relatedTarget)) return;
+    finish(false);
+  });
 }
 
 function connect() {
@@ -1051,30 +1164,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         try:
             payload = json.loads(self.rfile.read(length))
-            capcode = str(payload["capcode"])
+            if "capcodes" in payload:
+                raw_capcodes = payload["capcodes"]
+                if not isinstance(raw_capcodes, list):
+                    raise TypeError
+            else:
+                raw_capcodes = [payload["capcode"]]
             label = str(payload.get("label", ""))
         except (ValueError, KeyError, TypeError):
             self.send_error(400)
             return
-        capcode = capcode.lstrip("0") or "0"
-        if not capcode.isascii() or not capcode.isdigit() or len(capcode) > MAX_CAPCODE_LEN:
+        if len(raw_capcodes) == 0 or len(raw_capcodes) > MAX_BULK:
             self.send_error(400)
             return
+        capcodes = []
+        for c in raw_capcodes:
+            cc = str(c).lstrip("0") or "0"
+            if not cc.isascii() or not cc.isdigit() or len(cc) > MAX_CAPCODE_LEN:
+                self.send_error(400)
+                return
+            capcodes.append(cc)
         label = label.replace("<", "").replace(">", "").strip()
         if len(label) > MAX_LABEL_LEN:
             self.send_error(400)
             return
         with _labels_lock:
-            over_cap = (
-                bool(label) and capcode not in _labels and len(_labels) >= MAX_LABELS
-            )
+            if label:
+                new_count = len({c for c in capcodes if c not in _labels})
+                over_cap = len(_labels) + new_count > MAX_LABELS
+            else:
+                over_cap = False
             if not over_cap:
-                if label:
-                    _labels[capcode] = label
-                else:
-                    _labels.pop(capcode, None)
+                for cc in capcodes:
+                    if label:
+                        _labels[cc] = label
+                    else:
+                        _labels.pop(cc, None)
                 snapshot = dict(_labels)
-                save_labels(snapshot)  # under lock: on-disk order matches memory order
+                save_labels(snapshot)
         if over_cap:
             self.send_error(400)
             return

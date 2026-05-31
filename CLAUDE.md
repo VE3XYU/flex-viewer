@@ -98,7 +98,10 @@ State that persists: `enabledTypes` in `localStorage` under
 
 - **Labels** are a `capcode → name` map. They live server-side in
   `labels.json` (atomic writes), are served by `GET /labels`, and updated by
-  `POST /labels` ({"capcode","label"}; empty label deletes). The client holds a
+  `POST /labels` ({"capcode","label"}; empty label deletes).
+  `POST /labels` also accepts a bulk form `{"capcodes": [...], "label": "X"}` (one
+  atomic write, capped at `MAX_BULK`) used by group-tagging.
+  The client holds a
   `labels` object, fetched once via `loadLabels()`, and re-renders all pages on
   change. Keys use the same leading-zero-stripped capcode form as the feed. The
   POST handler is localhost-only (Host/Origin guard), validates capcode (digits,
@@ -111,6 +114,17 @@ State that persists: `enabledTypes` in `localStorage` under
   `python3 build_npa_nxx.py` (pulls CNAC per-NPA CSVs); `--check` runs offline
   self-tests. Labels and hints render via the `el()` helper (textContent only),
   never through DOMPurify.
+
+### Group-tagging
+
+A "group broadcast" is one message sent to many pagers at once (e.g. a trauma
+team activation). `findGroup(page)` (client) finds the distinct capcodes that
+received an **identical body within `GROUP_TIME_WINDOW` seconds** (keyed on the
+`ts` field — broadcasts spread across FLEX home frames, so wall-clock proximity,
+not frame distance, is the grouping axis; TEST pages excluded; `≥ GROUP_MIN_SIZE`
+distinct capcodes to count). When you edit a label on a page that's part of a
+group, the editor shows a default-checked "also tag N others" checkbox; checked +
+Enter bulk-tags the whole broadcast (overwrite) via the bulk `POST /labels`.
 
 ## Things to know before changing parser regexes
 
