@@ -13,7 +13,7 @@ from pathlib import Path
 
 LOG_PATH = Path(os.environ.get("LOG_PATH", Path(__file__).resolve().parent / "live.log"))
 PORT = 8732
-HISTORY_SIZE = 200
+HISTORY_SIZE = 500
 MAX_BODY = 4096
 NPA_NXX_PATH = Path(__file__).resolve().parent / "data" / "npa-nxx-on.json"
 LABELS_PATH = Path(__file__).resolve().parent / "labels.json"

@@ -41,7 +41,7 @@ primes from history on startup, then tails for new lines).
   Both must continue to parse — don't remove `LEGACY_RE` without checking real
   logs.
 - **`/stream`** is an SSE endpoint. On connect, it pushes a single
-  `event: history` with the full ring buffer (`HISTORY_SIZE = 200`),
+  `event: history` with the full ring buffer (`HISTORY_SIZE = 500`),
   then streams each new page as a default `message` event. The HTTP handler
   is `ThreadingHTTPServer`, one thread per subscriber; broadcast fan-out is a
   per-subscriber `queue.Queue` guarded by `_state_lock`.
