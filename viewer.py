@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import re
+import socket
 import threading
 import time
 import webbrowser
@@ -22,6 +23,9 @@ MAX_CAPCODE_LEN = 10
 MAX_LABELS = 5000
 MAX_POST_BODY = 65536  # 64 KB: fits a ~8 KB 500-capcode bulk request under the Content-Length guard
 MAX_BULK = 500         # max capcodes[] per bulk POST /labels
+SSE_QUEUE_MAX = 1000   # max buffered pages per SSE client; a client this far behind is
+                       # dropped from fan-out (it reconnects and re-primes from history),
+                       # so one wedged client can't grow server memory without bound
 
 _state_lock = threading.Lock()
 _subscribers: list[queue.Queue] = []
@@ -31,6 +35,9 @@ _id_lock = threading.Lock()
 _npa_nxx: dict[str, str] = {}  # "905201" -> "Markham, ON"; loaded once in main()
 _labels_lock = threading.Lock()
 _labels: dict[str, str] = {}  # "1234567" -> "Southlake"
+# GET host allowlist (anti DNS-rebinding). Loopback always; the LAN IP and any
+# $ALLOWED_HOSTS entries are added in main() so flex-lan-share.py keeps working.
+_allowed_get_hosts: set[str] = {"127.0.0.1", "localhost", "::1"}
 
 
 def alloc_id() -> int:
@@ -95,6 +102,30 @@ def save_labels(snapshot: dict) -> None:
     os.replace(tmp, LABELS_PATH)
 
 
+def detect_lan_ip():
+    """Best-effort egress-interface IP, so LAN-share clients (whose Host header
+    is this machine's LAN address) pass the GET host allowlist. Sends no traffic;
+    connecting a UDP socket just selects the interface. Returns None if offline."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def host_name(hostport: str) -> str:
+    """Hostname portion of a Host header, port stripped. Handles [::1]:port."""
+    h = hostport.strip()
+    if h.startswith("["):
+        return h[1:].split("]", 1)[0]
+    if ":" in h:
+        return h.rsplit(":", 1)[0]
+    return h
+
+
 PIPE_RE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}): (?P<proto>FLEX(?:_NEXT)?)"
     r"\|[^|]+\|(?P<mode>[^|]+)\|(?P<frame>[^|]+)\|(?P<capcode>[^|]+)"
@@ -147,17 +178,39 @@ def broadcast(rec: dict) -> None:
     payload = ("data: " + json.dumps(rec) + "\n\n").encode("utf-8")
     with _state_lock:
         _history.append(rec)
-        dead = []
-        for q in _subscribers:
-            try:
-                q.put_nowait(payload)
-            except Exception:
-                dead.append(q)
-        for q in dead:
-            try:
-                _subscribers.remove(q)
-            except ValueError:
-                pass
+        _fan_out(payload)
+
+
+def clear_log() -> None:
+    """Truncate the page log and drop in-memory history. Labels are untouched.
+
+    Truncating in place (not unlink/replace) keeps decode.sh's `tee -a` writing
+    to the same file; tail_log() notices the shrink and rewinds.
+    """
+    with _state_lock:
+        if LOG_PATH.exists():
+            with LOG_PATH.open("r+") as f:
+                f.truncate(0)
+        _history.clear()
+        _fan_out(b"event: cleared\ndata: {}\n\n")
+
+
+def _fan_out(payload: bytes) -> None:
+    # Caller holds _state_lock.
+    dead = []
+    for q in _subscribers:
+        try:
+            q.put_nowait(payload)
+        except Exception:
+            # queue.Full (client SSE_QUEUE_MAX pages behind / wedged) or any
+            # other error: drop it. Its handler tears the connection down and
+            # the browser's EventSource reconnects, re-priming from history.
+            dead.append(q)
+    for q in dead:
+        try:
+            _subscribers.remove(q)
+        except ValueError:
+            pass
 
 
 def flush(buf: list[str]) -> None:
@@ -202,6 +255,12 @@ def tail_log() -> None:
         while True:
             line = f.readline()
             if not line:
+                if os.path.getsize(LOG_PATH) < f.tell():
+                    # Log was cleared (truncated): rewind, drop any partial record.
+                    f.seek(0)
+                    buf = []
+                    idle = 0.0
+                    continue
                 idle += 0.5
                 if buf and idle > 2.0:
                     flush(buf)
@@ -361,6 +420,17 @@ input[type=text]::placeholder { color: var(--dim); }
 .filter-clear:hover { color: var(--text); background: rgba(255,255,255,0.06); }
 .filter-clear:focus-visible { outline: none; color: var(--accent); }
 .filter-clear.visible { display: block; }
+.clear-log {
+  font: inherit;
+  font-size: 12px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.clear-log:hover { color: #ff6b6b; border-color: #ff6b6b; }
 main {
   max-width: 960px;
   margin: 0 auto;
@@ -548,8 +618,12 @@ function clearFilter() {
 }
 
 const SANITIZE_CONFIG = {
+  // Page bodies are attacker-influenceable (anyone can transmit a FLEX page).
+  // 'color' is all the viewer's own formatting needs; 'style' is deliberately
+  // NOT allowed — it would let an OTA body smuggle CSS (e.g. background:url(...)
+  // tracking/exfil beacons) through the sanitizer.
   ALLOWED_TAGS: ['b', 'i', 'u', 'em', 'strong', 'br', 'font'],
-  ALLOWED_ATTR: ['color', 'style'],
+  ALLOWED_ATTR: ['color'],
 };
 
 const pages = [];
@@ -768,12 +842,21 @@ function structureBody(text) {
   return out.join('\n');
 }
 
-function renderBody(text) {
+function renderBody(p) {
+  // Memoize the sanitized HTML on the page object. rerender() runs on every
+  // filter keystroke and rebuilds every visible page; without this cache each
+  // pass re-runs structureBody + DOMPurify over all ~500 bodies (the dominant
+  // cost). Recompute only when the body actually changes (a stitched fragment
+  // was appended), keyed on the exact source text.
+  if (p._bodyHtml == null || p._bodyHtmlSrc !== p.body) {
+    const structured = structureBody(String(p.body));
+    const withBreaks = structured.replace(/\n/g, '<br>');
+    // DOMPurify is the only thing allowed to write HTML into the DOM.
+    p._bodyHtml = DOMPurify.sanitize(withBreaks, SANITIZE_CONFIG);
+    p._bodyHtmlSrc = p.body;
+  }
   const div = el('div', 'body');
-  const structured = structureBody(String(text));
-  const withBreaks = structured.replace(/\n/g, '<br>');
-  // DOMPurify is the only thing allowed to write HTML into the DOM.
-  div.innerHTML = DOMPurify.sanitize(withBreaks, SANITIZE_CONFIG);
+  div.innerHTML = p._bodyHtml;  // already DOMPurify-sanitized above
   return div;
 }
 
@@ -800,7 +883,7 @@ function makePage(p, fresh) {
     meta.appendChild(el('span', 'proto', 'next'));
   }
   article.appendChild(meta);
-  article.appendChild(renderBody(p.body));
+  article.appendChild(renderBody(p));
   if (p.hints && p.hints.length) {
     const hintsEl = el('div', 'hints');
     p.hints.forEach(h => hintsEl.appendChild(el('div', 'hint', '↳ ' + h.num + ' — ' + h.place)));
@@ -871,10 +954,19 @@ function addPage(p) {
   updateCount();
 }
 
+function debounce(fn, ms) {
+  let t = null;
+  return function () { clearTimeout(t); t = setTimeout(fn, ms); };
+}
+// Filter typing fires per keystroke; coalesce the (full-list) rerender so fast
+// typing doesn't rebuild the page list on every character. Other rerender
+// callers (chips, label save, clear) are low-frequency and stay immediate.
+const rerenderSoon = debounce(rerender, 120);
+
 filterInput.addEventListener('input', () => {
   filter = filterInput.value.trim().toLowerCase();
   syncClearVisibility();
-  rerender();
+  rerenderSoon();
 });
 
 filterInput.addEventListener('keydown', (e) => {
@@ -1033,8 +1125,19 @@ function connect() {
     stitched.reverse().forEach(p => pages.push(p));
     rerender();
   });
+  src.addEventListener('cleared', () => {
+    pages.length = 0;
+    rerender();
+  });
   src.onmessage = e => addPage(JSON.parse(e.data));
 }
+
+document.getElementById('clearLog').addEventListener('click', () => {
+  if (!confirm('Delete all logged pages from this machine? Capcode labels are kept.')) return;
+  fetch('/clear', { method: 'POST' })
+    .then(r => { if (!r.ok) alert('Clear failed (' + r.status + '). Only allowed from this machine.'); })
+    .catch(() => alert('Clear failed.'));
+});
 
 loadLabels();
 connect();
@@ -1050,7 +1153,9 @@ def render_html() -> bytes:
         '<link rel="preconnect" href="https://fonts.googleapis.com">\n',
         '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n',
         '<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">\n',
-        '<script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.7/dist/purify.min.js" crossorigin="anonymous"></script>\n',
+        '<script src="https://cdn.jsdelivr.net/npm/dompurify@3.2.7/dist/purify.min.js"'
+        ' integrity="sha384-qJNkHwhlYywDHfyoEe1np+1lYvX/8x+3gHCKFhSSBMQyCFlvFnn+zXmaebXl21rV"'
+        ' crossorigin="anonymous"></script>\n',
         "<style>",
         CSS,
         "</style>\n</head>\n<body>\n",
@@ -1068,6 +1173,7 @@ def render_html() -> bytes:
         '    <input type="text" id="filter" placeholder="filter capcode or text…" autocomplete="off">\n',
         '    <button class="filter-clear" id="filterClear" type="button" aria-label="Clear filter" title="Clear filter (Esc)">×</button>\n',
         '  </div>\n',
+        '  <button class="clear-log" id="clearLog" type="button" title="Delete the page log (labels are kept)">Clear log</button>\n',
         '</header>\n',
         '<main id="list"><div class="empty">Listening for pages…</div></main>\n',
         "<script>",
@@ -1084,6 +1190,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
+        # Anti DNS-rebinding: only serve hosts we expect (loopback, the LAN IP,
+        # or $ALLOWED_HOSTS). A rebound attacker domain sends its own name as the
+        # Host and is rejected, so a remote page can't read the PHI feed/labels.
+        if host_name(self.headers.get("Host", "")) not in _allowed_get_hosts:
+            self.send_error(403)
+            return
         if self.path in ("/", "/index.html"):
             data = render_html()
             self.send_response(200)
@@ -1100,7 +1212,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Connection", "keep-alive")
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
-            q: queue.Queue = queue.Queue()
+            q: queue.Queue = queue.Queue(maxsize=SSE_QUEUE_MAX)
             with _state_lock:
                 hist = list(_history)
                 _subscribers.append(q)
@@ -1139,7 +1251,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
-        if self.path != "/labels":
+        if self.path not in ("/labels", "/clear"):
             self.send_error(404)
             return
         # Local-only: reject anything not addressed to this loopback host.
@@ -1150,6 +1262,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if origin is None or not any(origin == "http://" + h for h in allowed):
             self.send_error(403)
+            return
+        if self.path == "/clear":
+            try:
+                clear_log()
+            except OSError:
+                self.send_error(500)
+                return
+            self.send_response(204)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -1215,6 +1337,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
+    global _allowed_get_hosts
+    lan = detect_lan_ip()
+    if lan:
+        _allowed_get_hosts.add(lan)
+    for h in os.environ.get("ALLOWED_HOSTS", "").split(","):
+        h = h.strip()
+        if h:
+            _allowed_get_hosts.add(host_name(h))
     load_npa_nxx()
     load_labels()
     prime_history()

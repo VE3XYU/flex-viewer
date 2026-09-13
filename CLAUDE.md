@@ -44,15 +44,26 @@ primes from history on startup, then tails for new lines).
   `event: history` with the full ring buffer (`HISTORY_SIZE = 500`),
   then streams each new page as a default `message` event. The HTTP handler
   is `ThreadingHTTPServer`, one thread per subscriber; broadcast fan-out is a
-  per-subscriber `queue.Queue` guarded by `_state_lock`.
+  per-subscriber `queue.Queue(maxsize=SSE_QUEUE_MAX)` guarded by `_state_lock`.
+  A subscriber whose queue fills (client `SSE_QUEUE_MAX` pages behind / wedged)
+  is dropped from fan-out so one stalled client can't grow memory without bound;
+  its `EventSource` reconnects and re-primes from history.
 - **`render_html()`** returns the entire UI (CSS + JS) inline. There is no
   static file serving — `/` returns HTML, `/stream` returns SSE, and
-  `/labels` serves (GET) and updates (POST) the capcode-label store; everything
-  else 404s. DOMPurify is loaded from jsDelivr.
+  `/labels` serves (GET) and updates (POST) the capcode-label store, and
+  `POST /clear` (loopback-only, same guard as `POST /labels`) truncates the log in
+  place, empties `_history`, and sends an SSE `event: cleared` — labels untouched,
+  and `tail_log()` rewinds when it sees the file shrink; everything
+  else 404s. Every GET enforces a Host allowlist (`_allowed_get_hosts`: loopback
+  + the detected LAN IP + any `$ALLOWED_HOSTS`) to block DNS-rebinding reads of
+  the feed/labels — a rebound attacker domain sends its own name as `Host` and
+  gets 403. DOMPurify is loaded from jsDelivr, pinned with an SRI `integrity`
+  hash (recompute it if you bump the version, or the browser will block it).
 
 Config lives as constants at the top of `viewer.py` (`LOG_PATH`, `PORT`,
-`HISTORY_SIZE`, `MAX_BODY`). Only `LOG_PATH` is also overridable via env in
-the shell scripts.
+`HISTORY_SIZE`, `MAX_BODY`, `SSE_QUEUE_MAX`). `LOG_PATH` is overridable via env
+in the shell scripts; `ALLOWED_HOSTS` (comma-separated extra GET hosts) is read
+from env in `main()`.
 
 ### Frontend (inline JS in `viewer.py`)
 
@@ -88,7 +99,8 @@ The non-obvious behavior is concentrated in three places:
    Only lines with **2+** label hits get rewritten — a single `Label:` per
    line is left alone. After structuring, `\n` → `<br>` and the result goes
    through DOMPurify with a tight allowlist (`b i u em strong br font`,
-   attrs `color style`). DOMPurify is the only path that writes HTML into
+   attr `color` only — `style` is intentionally excluded so OTA bodies can't
+   smuggle CSS beacons). DOMPurify is the only path that writes HTML into
    the DOM — keep it that way.
 
 State that persists: `enabledTypes` in `localStorage` under
@@ -104,7 +116,8 @@ State that persists: `enabledTypes` in `localStorage` under
   The client holds a
   `labels` object, fetched once via `loadLabels()`, and re-renders all pages on
   change. Keys use the same leading-zero-stripped capcode form as the feed. The
-  POST handler is localhost-only (Host/Origin guard), validates capcode (digits,
+  POST handler is loopback-only (Host/Origin guard — stricter than GET's host
+  allowlist, so LAN-share clients stay view-only), validates capcode (digits,
   ≤10) and label (≤64, `<`/`>` stripped), and caps total labels.
 - **Callback hints** are computed server-side: `phone_hints()` runs `PHONE_RE`
   over the body and maps NPA-NXX → town via `_npa_nxx`, attached as `rec["hints"]`
