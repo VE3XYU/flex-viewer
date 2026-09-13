@@ -178,20 +178,39 @@ def broadcast(rec: dict) -> None:
     payload = ("data: " + json.dumps(rec) + "\n\n").encode("utf-8")
     with _state_lock:
         _history.append(rec)
-        dead = []
-        for q in _subscribers:
-            try:
-                q.put_nowait(payload)
-            except Exception:
-                # queue.Full (client SSE_QUEUE_MAX pages behind / wedged) or any
-                # other error: drop it. Its handler tears the connection down and
-                # the browser's EventSource reconnects, re-priming from history.
-                dead.append(q)
-        for q in dead:
-            try:
-                _subscribers.remove(q)
-            except ValueError:
-                pass
+        _fan_out(payload)
+
+
+def clear_log() -> None:
+    """Truncate the page log and drop in-memory history. Labels are untouched.
+
+    Truncating in place (not unlink/replace) keeps decode.sh's `tee -a` writing
+    to the same file; tail_log() notices the shrink and rewinds.
+    """
+    with _state_lock:
+        if LOG_PATH.exists():
+            with LOG_PATH.open("r+") as f:
+                f.truncate(0)
+        _history.clear()
+        _fan_out(b"event: cleared\ndata: {}\n\n")
+
+
+def _fan_out(payload: bytes) -> None:
+    # Caller holds _state_lock.
+    dead = []
+    for q in _subscribers:
+        try:
+            q.put_nowait(payload)
+        except Exception:
+            # queue.Full (client SSE_QUEUE_MAX pages behind / wedged) or any
+            # other error: drop it. Its handler tears the connection down and
+            # the browser's EventSource reconnects, re-priming from history.
+            dead.append(q)
+    for q in dead:
+        try:
+            _subscribers.remove(q)
+        except ValueError:
+            pass
 
 
 def flush(buf: list[str]) -> None:
@@ -236,6 +255,12 @@ def tail_log() -> None:
         while True:
             line = f.readline()
             if not line:
+                if os.path.getsize(LOG_PATH) < f.tell():
+                    # Log was cleared (truncated): rewind, drop any partial record.
+                    f.seek(0)
+                    buf = []
+                    idle = 0.0
+                    continue
                 idle += 0.5
                 if buf and idle > 2.0:
                     flush(buf)
@@ -395,6 +420,17 @@ input[type=text]::placeholder { color: var(--dim); }
 .filter-clear:hover { color: var(--text); background: rgba(255,255,255,0.06); }
 .filter-clear:focus-visible { outline: none; color: var(--accent); }
 .filter-clear.visible { display: block; }
+.clear-log {
+  font: inherit;
+  font-size: 12px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.clear-log:hover { color: #ff6b6b; border-color: #ff6b6b; }
 main {
   max-width: 960px;
   margin: 0 auto;
@@ -1089,8 +1125,19 @@ function connect() {
     stitched.reverse().forEach(p => pages.push(p));
     rerender();
   });
+  src.addEventListener('cleared', () => {
+    pages.length = 0;
+    rerender();
+  });
   src.onmessage = e => addPage(JSON.parse(e.data));
 }
+
+document.getElementById('clearLog').addEventListener('click', () => {
+  if (!confirm('Delete all logged pages from this machine? Capcode labels are kept.')) return;
+  fetch('/clear', { method: 'POST' })
+    .then(r => { if (!r.ok) alert('Clear failed (' + r.status + '). Only allowed from this machine.'); })
+    .catch(() => alert('Clear failed.'));
+});
 
 loadLabels();
 connect();
@@ -1126,6 +1173,7 @@ def render_html() -> bytes:
         '    <input type="text" id="filter" placeholder="filter capcode or text…" autocomplete="off">\n',
         '    <button class="filter-clear" id="filterClear" type="button" aria-label="Clear filter" title="Clear filter (Esc)">×</button>\n',
         '  </div>\n',
+        '  <button class="clear-log" id="clearLog" type="button" title="Delete the page log (labels are kept)">Clear log</button>\n',
         '</header>\n',
         '<main id="list"><div class="empty">Listening for pages…</div></main>\n',
         "<script>",
@@ -1203,7 +1251,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
-        if self.path != "/labels":
+        if self.path not in ("/labels", "/clear"):
             self.send_error(404)
             return
         # Local-only: reject anything not addressed to this loopback host.
@@ -1214,6 +1262,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if origin is None or not any(origin == "http://" + h for h in allowed):
             self.send_error(403)
+            return
+        if self.path == "/clear":
+            try:
+                clear_log()
+            except OSError:
+                self.send_error(500)
+                return
+            self.send_response(204)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))

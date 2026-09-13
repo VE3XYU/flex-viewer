@@ -50,7 +50,10 @@ primes from history on startup, then tails for new lines).
   its `EventSource` reconnects and re-primes from history.
 - **`render_html()`** returns the entire UI (CSS + JS) inline. There is no
   static file serving — `/` returns HTML, `/stream` returns SSE, and
-  `/labels` serves (GET) and updates (POST) the capcode-label store; everything
+  `/labels` serves (GET) and updates (POST) the capcode-label store, and
+  `POST /clear` (loopback-only, same guard as `POST /labels`) truncates the log in
+  place, empties `_history`, and sends an SSE `event: cleared` — labels untouched,
+  and `tail_log()` rewinds when it sees the file shrink; everything
   else 404s. Every GET enforces a Host allowlist (`_allowed_get_hosts`: loopback
   + the detected LAN IP + any `$ALLOWED_HOSTS`) to block DNS-rebinding reads of
   the feed/labels — a rebound attacker domain sends its own name as `Host` and
